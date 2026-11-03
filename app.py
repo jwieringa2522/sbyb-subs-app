@@ -252,6 +252,8 @@ __GRANTSYNC__
 Telegram roster, confirmed in and out by Justin. Nothing below is a
 website subscription.</div>
 __XSECTION__
+__STATS__
+__INSIGHTS__
 <div class="foot">Actions (cancel, refund) stay in Stripe for website
 subscribers. Telegram shows Joined when the roster sync has seen the
 join, otherwise Invite sent from the invite link on file. X, join and
@@ -527,11 +529,140 @@ def push_snapshot(payload: dict, key: str = ""):
             """INSERT INTO meta(key, value) VALUES('pushed_at', ?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
             (repr(pushed_at),))
+        # Lifecycle statistics ride along with the snapshot when the
+        # sync built them; a push without stats leaves the stored
+        # copy untouched (stats are cumulative state, not a mirror).
+        stats = payload.get("stats")
+        if isinstance(stats, dict):
+            con.execute(
+                """INSERT INTO meta(key, value) VALUES('stats', ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                   value=excluded.value""",
+                (json.dumps(stats),))
         con.commit()
     finally:
         con.close()
     return {"ok": True, "subs": n}
 
+
+
+def _render_stats(stats, dstr, esc):
+    """Statistics + "What I see" sections, rendered from the stats
+    payload the VM sync builds (stats_builder) and pushes with each
+    snapshot. Honest placeholders until the first stats payload
+    lands; every rate shows its counts, nothing is estimated."""
+    secnote = ('<div class="secnote">Lifecycle tracking since '
+               "Nov 3, 2026 - trials, conversions, cancellations "
+               "and refunds, counted from the registry and the "
+               "roster. Rates always show their counts.</div>")
+    isec = ('<h2>What I see</h2><div class="secnote">Read of the '
+            "numbers above - suggestions only, nothing here changes "
+            "anything by itself.</div>")
+    if not isinstance(stats, dict):
+        return (("<h2>Statistics</h2>" + secnote
+                 + '<div class="line mut">Statistics start '
+                   "compiling with the next sync.</div>"),
+                (isec + '<div class="line mut">Nothing to flag '
+                        "yet.</div>"))
+    totals = stats.get("totals") or {}
+    trials = stats.get("trials") or {}
+    paid_c = stats.get("paid_cancels") or {}
+    refunds = stats.get("refunds") or 0
+    if isinstance(refunds, dict):
+        refunds = refunds.get("count", 0)
+    tiles = [
+        (totals.get("signups_tracked", 0), "Signups tracked"),
+        (trials.get("started", 0), "Trials started"),
+        (trials.get("converted", 0), "Trials converted"),
+        (trials.get("canceled_in_trial", 0), "Trial cancels"),
+        (paid_c.get("total", 0), "Paid cancels"),
+        (refunds, "Refunds"),
+    ]
+    out = ["<h2>Statistics</h2>", secnote, '<div class="strip">']
+    for n, k in tiles:
+        out.append(f'<div class="tile"><div class="n">{esc(str(n))}'
+                   f'</div><div class="k">{esc(k)}</div></div>')
+    out.append("</div>")
+    conv = trials.get("converted", 0)
+    canc = trials.get("canceled_in_trial", 0)
+    done = trials.get("completed")
+    if done is None:
+        done = conv + canc
+    if done > 0:
+        pct = round(100.0 * conv / done)
+        out.append(f'<div class="line">Trial outcome: {conv} of '
+                   f"{done} converted ({pct}%), {canc} "
+                   "canceled.</div>")
+        if canc > 0:
+            buckets = trials.get("cancel_buckets") or {}
+            out.append('<div class="line">Trial cancels by timing: '
+                       f"{buckets.get('le2d', 0)} within 2 days, "
+                       f"{buckets.get('d3_7', 0)} on days 3-7.</div>")
+    else:
+        out.append('<div class="line mut">No completed trials '
+                   "yet.</div>")
+    if (paid_c.get("total") or 0) > 0:
+        pb = paid_c.get("buckets") or {}
+        out.append('<div class="line">Paid cancels by tenure: '
+                   f"{pb.get('le7d', 0)} in the first week, "
+                   f"{pb.get('d8_30', 0)} in days 8-30, "
+                   f"{pb.get('gt30', 0)} after 30 days.</div>")
+    plan_mix = stats.get("plan_mix") or {}
+    if plan_mix:
+        items = ", ".join(
+            f"{esc(str(p))} {c}" for p, c in
+            sorted(plan_mix.items(), key=lambda kv: (-kv[1], kv[0])))
+        out.append(f'<div class="line">Plan mix now: {items}</div>')
+    sources = stats.get("sources") or {}
+    x = sources.get("x") or {}
+    if sources.get("x_available") is False:
+        out.append('<div class="line">Sources: '
+                   f"{sources.get('website_signups', 0)} signups "
+                   "via the website; X roster unavailable right "
+                   "now.</div>")
+    else:
+        out.append('<div class="line">Sources: '
+                   f"{sources.get('website_signups', 0)} signups "
+                   f"via the website; X roster: {x.get('in', 0)} "
+                   f"in, {x.get('invite_sent', 0)} invite sent, "
+                   f"{x.get('out', 0)} out "
+                   f"({x.get('added_30d', 0)} added in the last "
+                   "30 days).</div>")
+    events = stats.get("events") or []
+    if events:
+        out.append('<div class="line" style="margin-top:10px">'
+                   "Recent activity</div>")
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            when = dstr(e.get("ts")) or "-"
+            out.append(f'<div class="line">{esc(when)} - '
+                       f"{esc(e.get('email') or '')} - "
+                       f"{esc(e.get('text') or '')}</div>")
+    else:
+        out.append('<div class="line mut">No activity tracked '
+                   "yet.</div>")
+    insights = stats.get("insights") or []
+    if insights:
+        cards = []
+        for ins in insights:
+            if not isinstance(ins, dict):
+                continue
+            level = ins.get("level") or "info"
+            style = ""
+            if level == "watch":
+                style = ' style="border-left:4px solid #8a6d1f"'
+            elif level == "good":
+                style = ' style="border-left:4px solid #175263"'
+            cards.append(
+                f'<div class="card"{style}><div class="line" '
+                f'style="margin:0">{esc(ins.get("text") or "")}'
+                "</div></div>")
+        insights_html = isec + "".join(cards)
+    else:
+        insights_html = isec + ('<div class="line mut">Nothing to '
+                                "flag yet.</div>")
+    return "".join(out), insights_html
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -584,6 +715,14 @@ def dashboard(key: str = ""):
             pushed_at = float(mrow[0]) if mrow else None
         except (TypeError, ValueError):
             pushed_at = None
+        srow = con.execute(
+            "SELECT value FROM meta WHERE key='stats'").fetchone()
+        stats = None
+        if srow:
+            try:
+                stats = json.loads(srow[0])
+            except (TypeError, ValueError):
+                stats = None
     finally:
         con.close()
 
@@ -982,6 +1121,8 @@ def dashboard(key: str = ""):
                 f"{mu.strftime('%b')} {mu.day}, "
                 f"{mu.strftime('%I:%M %p')} Winnipeg.</div>")
 
+    stats_html, insights_html = _render_stats(stats, dstr, _esc)
+
     upd = datetime.fromtimestamp(now, tz)
     updated = f"{upd.strftime('%b')} {upd.day}, {upd.strftime('%I:%M %p')}"
     if pushed_at:
@@ -1003,7 +1144,9 @@ def dashboard(key: str = ""):
             .replace("__SUMMARY2__", summary2)
             .replace("__CARDS__", "".join(cards))
             .replace("__GRANTSYNC__", grantsync)
-            .replace("__XSECTION__", xsection))
+            .replace("__XSECTION__", xsection)
+            .replace("__STATS__", stats_html)
+            .replace("__INSIGHTS__", insights_html))
     return HTMLResponse(page, headers={
         "X-Robots-Tag": "noindex, nofollow",
         "Cache-Control": "no-store"})
