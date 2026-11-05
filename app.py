@@ -91,7 +91,14 @@ def _subs_db():
     # carries the full current list.
     con.execute("""CREATE TABLE IF NOT EXISTS x_subs(
         handle TEXT PRIMARY KEY, status TEXT, tg_username TEXT,
-        created_at TEXT, joined_at TEXT, updated_ts REAL)""")
+        created_at TEXT, joined_at TEXT, updated_ts REAL,
+        member_confirmed_ts TEXT, member_note TEXT)""")
+    xcols = {r[1] for r in con.execute("PRAGMA table_info(x_subs)")}
+    if "member_confirmed_ts" not in xcols:
+        con.execute(
+            "ALTER TABLE x_subs ADD COLUMN member_confirmed_ts TEXT")
+    if "member_note" not in xcols:
+        con.execute("ALTER TABLE x_subs ADD COLUMN member_note TEXT")
     # TradingView grants are executed by hand (no TV API); the record
     # of who holds what arrives with each snapshot. Without a record
     # for a subscriber's username the dashboard honestly shows the
@@ -250,7 +257,9 @@ __GRANTSYNC__
 <h2>X subscribers</h2>
 <div class="secnote">Separate plan, billed on X - tracked in the
 Telegram roster, confirmed in and out by Justin. Nothing below is a
-website subscription.</div>
+website subscription. 'Confirmed' means Justin verified the person is
+in the channel even though the join did not come through the tracked
+invite link.</div>
 __XSECTION__
 __STATS__
 __INSIGHTS__
@@ -400,7 +409,7 @@ def push_snapshot(payload: dict, key: str = ""):
                  canceled_ts and card_display)
       joins:     [{email, status, tg_username, joined_at}]
       x_subs:    [{handle, status, tg_username, created_at,
-                 joined_at}]
+                 joined_at, member_confirmed_ts, member_note}]
       grants:    [{tv_username, indicators, granted, note}]
       tv_claims: optional [{email, tv_username, matched, ts}]
     Snapshot-replace semantics: inside one transaction the local
@@ -488,12 +497,15 @@ def push_snapshot(payload: dict, key: str = ""):
                 continue
             con.execute(
                 """INSERT INTO x_subs(handle, status, tg_username,
-                       created_at, joined_at, updated_ts)
-                   VALUES(?,?,?,?,?,?)""",
+                       created_at, joined_at, updated_ts,
+                       member_confirmed_ts, member_note)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (handle, (x.get("status") or "")[:32],
                  (x.get("tg_username") or "")[:64] or None,
                  (x.get("created_at") or "")[:32] or None,
-                 (x.get("joined_at") or "")[:32] or None, pushed_at))
+                 (x.get("joined_at") or "")[:32] or None, pushed_at,
+                 (x.get("member_confirmed_ts") or "")[:32] or None,
+                 (x.get("member_note") or "")[:256] or None))
         con.execute("DELETE FROM tv_grants")
         for g in grants:
             if not isinstance(g, dict):
@@ -693,7 +705,8 @@ def dashboard(key: str = ""):
             "SELECT email, status, tg_username FROM telegram_joins")}
         xrows = con.execute(
             """SELECT handle, status, tg_username, created_at, joined_at,
-               updated_ts FROM x_subs ORDER BY created_at""").fetchall()
+               updated_ts, member_confirmed_ts, member_note
+               FROM x_subs ORDER BY created_at""").fetchall()
         grants = {}
         grants_synced = None
         for tvn, inds, granted, note, gu in con.execute(
@@ -1075,36 +1088,66 @@ def dashboard(key: str = ""):
                     "data synced yet - the roster sync pushes it every "
                     "15 minutes.</span></div>")
     else:
-        x_counts = {}
+        # Join state per row: 'active' = joined via the tracked link
+        # (proof on file); a member_confirmed_ts = Justin verified the
+        # person is in the channel even though the join never came
+        # through the tracked link - shown as In, without inventing a
+        # join date or Telegram name; 'removed' = Out; anything else
+        # = invite sent, not joined yet.
+        def x_state(xstatus, xconfirmed):
+            if xstatus == "active":
+                return "in"
+            if xconfirmed and xstatus != "removed":
+                return "confirmed"
+            if xstatus == "removed":
+                return "out"
+            return "sent"
+
+        x_counts = {"in": 0, "sent": 0, "out": 0}
         for xr in xrows:
-            x_counts[xr[1] or "unknown"] = \
-                x_counts.get(xr[1] or "unknown", 0) + 1
+            st8 = x_state(xr[1], xr[6])
+            if st8 in ("in", "confirmed"):
+                x_counts["in"] += 1
+            elif st8 == "out":
+                x_counts["out"] += 1
+            else:
+                x_counts["sent"] += 1
         x_tiles = [
-            (str(x_counts.get("active", 0)), "In"),
-            (str(x_counts.get("pending", 0)), "Invite sent"),
-            (str(x_counts.get("removed", 0)), "Out"),
+            (str(x_counts["in"]), "In"),
+            (str(x_counts["sent"]), "Invite sent"),
+            (str(x_counts["out"]), "Out"),
         ]
         xsection = '<div class="strip">' + "".join(
             f'<div class="tile"><div class="n">{_esc(n)}</div>'
             f'<div class="k">{_esc(k)}</div></div>'
             for n, k in x_tiles) + "</div>"
-        x_badges = {"active": ("In", "b-active"),
-                    "pending": ("Invite sent", "b-trialing"),
-                    "removed": ("Out", "b-canceled")}
-        for handle, xstatus, xtg, xcreated, xjoined, _xu in xrows:
-            blabel, bclass = x_badges.get(
-                xstatus or "", ((xstatus or "Unknown").title(), "b-other"))
+        for (handle, xstatus, xtg, xcreated, xjoined, _xu,
+             xconfirmed, _xnote) in xrows:
+            st8 = x_state(xstatus, xconfirmed)
             added = fmt_iso(xcreated)
             joined = fmt_iso(xjoined)
-            if xstatus == "active":
+            if st8 == "in":
+                blabel, bclass = "In the channel", "b-active"
                 since = f"In since {joined or added or '-'}"
-            elif xstatus == "removed":
+                tg_line = f" - Telegram @{_esc(xtg)}" if xtg else ""
+            elif st8 == "confirmed":
+                blabel, bclass = "In the channel", "b-active"
+                conf = fmt_iso(xconfirmed)
+                since = (f"Confirmed {conf or '-'} - joined another "
+                         "way, so no join date or Telegram name is "
+                         "on file.")
+                tg_line = ""
+            elif st8 == "out":
+                blabel, bclass = "Out", "b-canceled"
                 since = f"Added {added or '-'}"
                 if joined:
                     since += f" - joined {joined}"
+                tg_line = f" - Telegram @{_esc(xtg)}" if xtg else ""
             else:
+                blabel, bclass = ("Invite sent - not joined yet",
+                                  "b-trialing")
                 since = f"Added {added or '-'}"
-            tg_line = f" - Telegram @{_esc(xtg)}" if xtg else ""
+                tg_line = f" - Telegram @{_esc(xtg)}" if xtg else ""
             xsection += (
                 f'<div class="card" data-scope="x" '
                 f'data-search="{_esc(((handle or "") + " " + (xtg or "")).lower())}">'
