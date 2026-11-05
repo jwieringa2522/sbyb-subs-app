@@ -99,6 +99,9 @@ def _subs_db():
             "ALTER TABLE x_subs ADD COLUMN member_confirmed_ts TEXT")
     if "member_note" not in xcols:
         con.execute("ALTER TABLE x_subs ADD COLUMN member_note TEXT")
+    if "tester" not in xcols:
+        con.execute(
+            "ALTER TABLE x_subs ADD COLUMN tester INTEGER DEFAULT 0")
     # TradingView grants are executed by hand (no TV API); the record
     # of who holds what arrives with each snapshot. Without a record
     # for a subscriber's username the dashboard honestly shows the
@@ -498,14 +501,15 @@ def push_snapshot(payload: dict, key: str = ""):
             con.execute(
                 """INSERT INTO x_subs(handle, status, tg_username,
                        created_at, joined_at, updated_ts,
-                       member_confirmed_ts, member_note)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                       member_confirmed_ts, member_note, tester)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
                 (handle, (x.get("status") or "")[:32],
                  (x.get("tg_username") or "")[:64] or None,
                  (x.get("created_at") or "")[:32] or None,
                  (x.get("joined_at") or "")[:32] or None, pushed_at,
                  (x.get("member_confirmed_ts") or "")[:32] or None,
-                 (x.get("member_note") or "")[:256] or None))
+                 (x.get("member_note") or "")[:256] or None,
+                 1 if x.get("tester") else 0))
         con.execute("DELETE FROM tv_grants")
         for g in grants:
             if not isinstance(g, dict):
@@ -633,13 +637,19 @@ def _render_stats(stats, dstr, esc):
                    "via the website; X roster unavailable right "
                    "now.</div>")
     else:
+        tester_note = ""
+        ntesters = x.get("testers", 0) or 0
+        if ntesters:
+            tester_note = (f"; plus {ntesters} free-access tester"
+                           f"{'s' if ntesters != 1 else ''}, not "
+                           "counted as subscribers")
         out.append('<div class="line">Sources: '
                    f"{sources.get('website_signups', 0)} signups "
                    f"via the website; X roster: {x.get('in', 0)} "
                    f"in, {x.get('invite_sent', 0)} invite sent, "
                    f"{x.get('out', 0)} out "
                    f"({x.get('added_30d', 0)} added in the last "
-                   "30 days).</div>")
+                   f"30 days){tester_note}.</div>")
     events = stats.get("events") or []
     if events:
         out.append('<div class="line" style="margin-top:10px">'
@@ -705,7 +715,7 @@ def dashboard(key: str = ""):
             "SELECT email, status, tg_username FROM telegram_joins")}
         xrows = con.execute(
             """SELECT handle, status, tg_username, created_at, joined_at,
-               updated_ts, member_confirmed_ts, member_note
+               updated_ts, member_confirmed_ts, member_note, tester
                FROM x_subs ORDER BY created_at""").fetchall()
         grants = {}
         grants_synced = None
@@ -1122,7 +1132,7 @@ def dashboard(key: str = ""):
             f'<div class="k">{_esc(k)}</div></div>'
             for n, k in x_tiles) + "</div>"
         for (handle, xstatus, xtg, xcreated, xjoined, _xu,
-             xconfirmed, _xnote) in xrows:
+             xconfirmed, _xnote, xtester) in xrows:
             st8 = x_state(xstatus, xconfirmed)
             added = fmt_iso(xcreated)
             joined = fmt_iso(xjoined)
@@ -1148,6 +1158,10 @@ def dashboard(key: str = ""):
                                   "b-trialing")
                 since = f"Added {added or '-'}"
                 tg_line = f" - Telegram @{_esc(xtg)}" if xtg else ""
+            tester_line = (
+                '<div class="sub" style="margin:4px 0 0">'
+                "Free access - tester, not a paying subscriber</div>"
+                if xtester else "")
             xsection += (
                 f'<div class="card" data-scope="x" '
                 f'data-search="{_esc(((handle or "") + " " + (xtg or "")).lower())}">'
@@ -1155,7 +1169,7 @@ def dashboard(key: str = ""):
                 f'<div class="email">{_esc(handle or "")}</div>'
                 f'<span class="badge {bclass}">{_esc(blabel)}</span></div>'
                 f'<div class="sub" style="margin:8px 0 0">'
-                f"{_esc(since)}{tg_line}</div></div>")
+                f"{_esc(since)}{tg_line}</div>{tester_line}</div>")
         maxu = max((xr[5] or 0) for xr in xrows)
         if maxu:
             mu = datetime.fromtimestamp(maxu, tz)
